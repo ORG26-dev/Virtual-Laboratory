@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Virtual Laboratory · A-Frame VR prototype</title>
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="description" content="Virtual Laboratory: a simulated educational VR science lab (mixing coloured liquids, building a simple circuit) for Meta Quest Browser and desktop. Simulated demonstrations only.">
+<script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1320; font-family: system-ui, "Segoe UI", Roboto, Arial, sans-serif; }
+  #hud { position: fixed; left: 12px; bottom: 12px; z-index: 10; max-width: 430px; padding: 8px 12px;
+         background: rgba(8, 14, 24, 0.88); color: #f2f6fb; border: 2px solid #4a6fa5; border-radius: 10px;
+         font-size: 13px; line-height: 1.4; pointer-events: none; }
+  #hud b { color: #ffd60a; }
+  #hud .sim { display: block; margin-top: 4px; color: #ffc53d; font-weight: 700; }
+  @media (max-width: 640px) { #hud { font-size: 12px; max-width: 78vw; } }
+</style>
+
+<script>
+/* =====================================================================
+   Virtual Laboratory — single-file A-Frame prototype
+   All chemistry, measurements, reactions and safety behaviour in this
+   file are SIMULATED EDUCATIONAL DEMONSTRATIONS, not real laboratory
+   guidance or scientific measurement.
+   ===================================================================== */
+(function () {
+  'use strict';
+  const THREE = AFRAME.THREE;
+  const FONT = 'system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+  // ---------- small canvas helpers ----------
+  function rr(ctx, x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function font(ctx, px, weight) { ctx.font = (weight || 600) + ' ' + Math.round(px) + 'px ' + FONT; }
+  function wrap(ctx, text, maxW) {
+    const out = [];
+    String(text).split('\n').forEach(function (para) {
+      if (para === '') { out.push(''); return; }
+      let line = '';
+      para.split(' ').forEach(function (w) {
+        const test = line ? line + ' ' + w : w;
+        if (ctx.measureText(test).width > maxW && line) { out.push(line); line = w; } else { line = test; }
+      });
+      out.push(line);
+    });
+    return out;
+  }
+  function makeTexture(canvas) {
+    const t = new THREE.CanvasTexture(canvas);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = 4;
+    return t;
+  }
+
+  // ---------- vl-canvas: a plane whose texture is a 2D canvas we draw on ----------
+  AFRAME.registerComponent('vl-canvas', {
+    schema: { width: { default: 1 }, height: { default: 0.6 }, ppm: { default: 800 } },
+    init: function () {
+      const d = this.data;
+      this.canvas = document.createElement('canvas');
+      this.W = this.canvas.width = Math.round(d.width * d.ppm);
+      this.H = this.canvas.height = Math.round(d.height * d.ppm);
+      this.ctx = this.canvas.getContext('2d');
+      this.tex = makeTexture(this.canvas);
+      this.mat = new THREE.MeshBasicMaterial({ map: this.tex, transparent: true, alphaTest: 0.02, toneMapped: false });
+      this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(d.width, d.height), this.mat);
+      this.el.setObject3D('mesh', this.mesh);
+    },
+    commit: function () { this.tex.needsUpdate = true; },
+    remove: function () { this.el.removeObject3D('mesh'); this.tex.dispose(); this.mat.dispose(); this.mesh.geometry.dispose(); }
+  });
+
+  // ---------- vl-text: word-wrapped, high-contrast canvas text (sizes in metres) ----------
+  AFRAME.registerComponent('vl-text', {
+    schema: {
+      value: { default: '' }, width: { default: 0.4 }, height: { default: 0.1 }, ppm: { default: 1000 },
+      size: { default: 0.03 }, color: { default: '#ffffff' }, bg: { default: '' }, border: { default: '' },
+      align: { default: 'center' }, bold: { default: true }, pad: { default: 0.012 }, radius: { default: 0.01 },
+      lineHeight: { default: 1.22 }
+    },
+    init: function () {
+      this.canvas = document.createElement('canvas');
+      this.tex = null;
+      this.mat = new THREE.MeshBasicMaterial({ transparent: true, alphaTest: 0.02, toneMapped: false });
+      this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.mat);
+      this.el.setObject3D('mesh', this.mesh);
+    },
+    update: function (old) {
+      const d = this.data;
+      const W = Math.max(4, Math.round(d.width * d.ppm)), H = Math.max(4, Math.round(d.height * d.ppm));
+      if (!this.tex || this.canvas.width !== W || this.canvas.height !== H) {
+        this.canvas.width = W; this.canvas.height = H;
+        if (this.tex) this.tex.dispose();
+        this.tex = makeTexture(this.canvas);
+        this.mat.map = this.tex; this.mat.needsUpdate = true;
+      }
+      if (old.width !== d.width || old.height !== d.height) {
+        this.mesh.geometry.dispose();
+        this.mesh.geometry = new THREE.PlaneGeometry(d.width, d.height);
+      }
+      this.draw();
+    },
+    draw: function () {
+      const d = this.data, c = this.canvas, ctx = c.getContext('2d'), W = c.width, H = c.height, px = d.ppm;
+      ctx.clearRect(0, 0, W, H);
+      if (d.bg) { ctx.fillStyle = d.bg; rr(ctx, 0, 0, W, H, d.radius * px); ctx.fill(); }
+      if (d.border) {
+        const lw = Math.max(2, 0.004 * px);
+        ctx.lineWidth = lw; ctx.strokeStyle = d.border; rr(ctx, lw / 2, lw / 2, W - lw, H - lw, d.radius * px); ctx.stroke();
+      }
+      const fs = d.size * px, pad = d.pad * px;
+      font(ctx, fs, d.bold ? 700 : 500);
+      ctx.fillStyle = d.color; ctx.textBaseline = 'middle'; ctx.textAlign = d.align;
+      const lines = wrap(ctx, String(d.value).replace(/\\n/g, '\n'), W - 2 * pad);
+      const lh = fs * d.lineHeight;
+      let y = H / 2 - (lines.length * lh) / 2 + lh / 2;
+      const x = d.align === 'left' ? pad : d.align === 'right' ? W - pad : W / 2;
+      lines.forEach(function (l) { ctx.fillText(l, x, y, W - 2 * pad); y += lh; });
+      this.tex.needsUpdate = true;
+    },
+    remove: function () { this.el.removeObject3D('mesh'); if (this.tex) this.tex.dispose(); this.mat.dispose(); this.mesh.geometry.dispose(); }
+  });
+
+  // ---------- vl-act: makes an entity selectable (laser, gaze, mouse) ----------
+  AFRAME.registerComponent('vl-act', {
+    schema: { action: { default: '' }, arg: { default: '' }, hoverScale: { default: 1.07 } },
+    init: function () {
+      const el = this.el, self = this;
+      el.classList.add('clickable');
+      this.hovering = new Set(); this.base = null; this.last = 0;
+      this.onEnter = function (e) {
+        if (e.target !== el) return;
+        self.hovering.add((e.detail && e.detail.cursorEl) || 'x');
+        if (!self.base) self.base = el.object3D.scale.clone();
+        el.object3D.scale.copy(self.base).multiplyScalar(self.data.hoverScale);
+        self.glow(true);
+      };
+      this.onLeave = function (e) {
+        if (e.target !== el) return;
+        self.hovering.delete((e.detail && e.detail.cursorEl) || 'x');
+        if (self.hovering.size === 0) self.unhover();
+      };
+      this.onClick = function (e) {
+        if (e.target !== el || !el.classList.contains('clickable')) return;
+        const now = performance.now();
+        if (now - self.last < 350) return;            // debounce (two cursors / double events)
+        self.last = now;
+        VL.dispatch(self.data.action, self.data.arg, el, e);
+      };
+      el.addEventListener('mouseenter', this.onEnter);
+      el.addEventListener('mouseleave', this.onLeave);
+      el.addEventListener('click', this.onClick);
+    },
+    glow: function (on) {
+      const m = this.el.getObject3D('mesh');
+      if (m && m.material && m.material.emissive && m.material.opacity > 0) {
+        if (on) { this.prevEm = m.material.emissive.getHex(); m.material.emissive.setHex(0x334455); }
+        else if (this.prevEm !== undefined) { m.material.emissive.setHex(this.prevEm); }
+      }
+    },
+    unhover: function () {
+      this.hovering.clear();
+      if (this.base) this.el.object3D.scale.copy(this.base);
+      this.glow(false);
+    },
+    remove: function () {
+      this.el.removeEventListener('mouseenter', this.onEnter);
+      this.el.removeEventListener('mouseleave', this.onLeave);
+      this.el.removeEventListener('click', this.onClick);
+    }
+  });
+
+  // ---------- vl-button: box + label + vl-act ----------
+  AFRAME.registerComponent('vl-button', {
+    schema: {
+      label: { default: 'Button' }, width: { default: 0.36 }, height: { default: 0.085 }, color: { default: '#1f6feb' },
+      textColor: { default: '#ffffff' }, size: { default: 0.032 }, action: { default: '' }, arg: { default: '' }
+    },
+    init: function () {
+      const d = this.data, el = this.el;
+      el.setAttribute('geometry', { primitive: 'box', width: d.width, height: d.height, depth: 0.022 });
+      el.setAttribute('material', { color: d.color, roughness: 0.75, metalness: 0 });
+      const t = document.createElement('a-entity');
+      t.setAttribute('position', '0 0 0.0125');
+      t.setAttribute('vl-text', { value: d.label, width: d.width - 0.012, height: d.height - 0.01, size: d.size, color: d.textColor, ppm: 900, pad: 0.008 });
+      el.appendChild(t);
+      this.txt = t;
+      el.setAttribute('vl-act', { action: d.action, arg: d.arg });
+    },
+    update: function (old) {
+      const d = this.data;
+      if (!this.txt) return;
+      if (old.label !== undefined && old.label !== d.label) this.txt.setAttribute('vl-text', { value: d.label });
+      if (old.color !== undefined && old.color !== d.color) this.el.setAttribute('material', { color: d.color });
+      if (old.action !== undefined && (old.action !== d.action || old.arg !== d.arg)) this.el.setAttribute('vl-act', { action: d.action, arg: d.arg });
+    }
+  });
+
+  // ---------- hover feedback on laser / gaze cursors ----------
+  AFRAME.registerComponent('vl-ray-feedback', {
+    schema: { idle: { default: '#7fdbff' }, hover: { default: '#ffd60a' } },
+    init: function () {
+      const el = this.el, d = this.data;
+      el.addEventListener('mouseenter', function (e) {
+        if (e.target !== el) return;
+        if (el.components.raycaster && el.getAttribute('raycaster').showLine) el.setAttribute('raycaster', 'lineColor', d.hover);
+        const m = el.getObject3D('mesh'); if (m && m.material && m.material.color && !el.components['laser-controls']) m.material.color.set(d.hover);
+      });
+      el.addEventListener('mouseleave', function (e) {
+        if (e.target !== el) return;
+        if (el.components.raycaster && el.getAttribute('raycaster').showLine) el.setAttribute('raycaster', 'lineColor', d.idle);
+        const m = el.getObject3D('mesh'); if (m && m.material && m.material.color && !el.components['laser-controls']) m.material.color.set('#ffffff');
+      });
+    }
+  });
+
+  // ---------- the app: owns per-frame animation ----------
+  AFRAME.registerComponent('vl-app', {
+    init: function () {
+      const sc = this.el;
+      if (sc.hasLoaded) VL.init(sc); else sc.addEventListener('loaded', function () { VL.init(sc); });
+    },
+    tick: function (t, dt) { if (VL.ready) VL.tick(t / 1000, Math.min(dt || 16, 100) / 1000); }
+  });
+
+  // =====================================================================
+  //   APP LOGIC
+  // =====================================================================
+  const $ = function (id) { return document.getElementById(id); };
+  function E(parent, comps, tag) {
+    const e = document.createElement(tag || 'a-entity');
+    for (const k in comps) { if (comps[k] !== undefined && comps[k] !== null) e.setAttribute(k, comps[k]); }
+    parent.appendChild(e);
+    return e;
+  }
+  const HIT = { transparent: true, opacity: 0, depthWrite: false };          // invisible hit-box material
+  function hitbox(w, h, d) { return { primitive: 'box', width: w, height: h, depth: d }; }
+  function mat(color, extra) { return Object.assign({ color: color, roughness: 0.6, metalness: 0.05 }, extra || {}); }
+  function glass(extra) { return Object.assign({ color: '#d8ecff', opacity: 0.28, transparent: true, side: 'double', roughness: 0.08, metalness: 0.1, depthWrite: false }, extra || {}); }
+  function tag(parent, text, pos, opt) {
+    opt = opt || {};
+    // lift tilted tags so their lower edge never sinks into the bench top
+    const rot = opt.rot || '-55 0 0', h = (opt.t && opt.t.height) || 0.05;
+    const lift = Math.abs(Math.cos(parseFloat(rot) * Math.PI / 180)) * h / 2 + 0.002;
+    const pp = pos.split(' ').map(Number); pp[1] += lift;
+    return E(parent, {
+      position: pp.join(' '), rotation: rot,
+      'vl-text': Object.assign({ value: text, width: 0.15, height: 0.05, size: 0.017, bg: 'rgba(8,14,24,0.92)', color: '#ffffff', radius: 0.006, ppm: 1500, pad: 0.004 }, opt.t || {})
+    });
+  }
+  function setText(el, value) { if (el) el.setAttribute('vl-text', { value: value }); }
+  function meshMat(el) { const m = el && el.getObject3D('mesh'); return m ? m.material : null; }
+  const ease = function (p) { return p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; };
+  const lerp = function (a, b, p) { return a + (b - a) * p; };
+
+  const NOTES = {
+    'no-goggles': 'You handled liquids before putting on goggles. Real labs expect eye protection first.',
+    'overfill': 'You hit the fill limit. Keeping glassware below about two-thirds full helps prevent spills.',
+    'wrong-liquid': 'Solution C gave an off-target colour. Reading labels before pouring avoids this.',
+    'chem-quiz': 'Your first answer did not match the observation. Comparing before and after is a key lab skill.',
+    'wrong-slot': 'A part went to the wrong spot first. Matching parts to labelled positions prevents wiring errors.',
+    'open-circuit': 'You closed the switch on an incomplete loop. Current only flows round a complete path.',
+    'short': 'You tested a short circuit. Current skips the bulb, and real batteries and wires can overheat.',
+    'circ-quiz': 'Your first answer did not match. An open switch is simply a gap in the loop.'
+  };
+
+  const VL = window.VL = {
+    ready: false, mode: 'menu', busy: 0, seated: false, gazeMode: 'auto', inVR: false,
+    controllers: new Set(), view: {}, tweens: [], fx: [], time: 0,
+
+    // ---------- startup ----------
+    init: function (scene) {
+      this.scene = scene;
+      this.panel = $('panelCanvas').components['vl-canvas'];
+      this.choices = [$('choice0'), $('choice1'), $('choice2')];
+      Chem.build($('chem'));
+      Circ.build($('circuit'));
+      this.buildSide();
+      // desktop: look slightly down so panel + bench are both in view
+      const cam = $('cam');
+      const setPitch = function () { const lc = cam.components['look-controls']; if (lc && lc.pitchObject) lc.pitchObject.rotation.x = -0.32; };
+      if (cam.hasLoaded) setPitch(); else cam.addEventListener('loaded', setPitch);
+
+      scene.addEventListener('enter-vr', function () {
+        if (!scene.is('vr-mode') && !scene.is('ar-mode')) return;
+        VL.inVR = true;
+        scene.setAttribute('raycaster', 'enabled', false);   // mouse ray is meaningless in-headset
+        clearTimeout(VL.gazeTimer); VL.gazeTimer = setTimeout(function () { VL.updateGaze(); }, 1500);
+      });
+      scene.addEventListener('exit-vr', function () {
+        VL.inVR = false; scene.setAttribute('raycaster', 'enabled', true); VL.updateGaze();
+      });
+      ['leftHand', 'rightHand'].forEach(function (id) {
+        const h = $(id);
+        h.addEventListener('controllerconnected', function () { VL.controllers.add(id); VL.updateGaze(); });
+        h.addEventListener('controllerdisconnected', function () { VL.controllers.delete(id); VL.updateGaze(); });
+      });
+      window.addEventListener('keydown', function (e) {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        const k = e.key.toLowerCase();
+        const map = { '1': ['start', 'chem'], '2': ['start', 'circuit'], 'm': ['menu', ''], 'r': ['reset', ''], 'h': ['hint', ''] };
+        if (map[k]) VL.dispatch(map[k][0], map[k][1], null, null);
+      });
+      const gm = $('gazeCursor').getObject3D('mesh'); if (gm) gm.renderOrder = 999;
+      this.ready = true;
+      this.updateGaze();
+      this.showMenu();
+      scene.emit('vl-ready');
+    },
+
+    buildSide: function () {
+      // left: how-to + disclaimer
+      setText($('infoText'),
+        'HOW TO INTERACT\n' +
+        '• Quest controllers — point the laser, pull the trigger.\n' +
+        '• No controllers — look at a button and hold your gaze about 1.5 s until the ring shrinks.\n' +
+        '• Desktop — drag to look, click to select. Keys 1 / 2 / H / R / M.\n\n' +
+        'No walking needed — stay seated or standing.\n\n' +
+        'All chemistry, measurements, reactions and safety behaviour here are SIMULATED EDUCATIONAL DEMONSTRATIONS, not real laboratory guidance or scientific measurement.');
+      setText($('ctlTitle'), 'CONTROLS');
+    },
+
+    // ---------- input routing ----------
+    dispatch: function (action, arg, el, evt) {
+      const global = ['menu', 'start', 'reset', 'hint', 'seated', 'gaze'];
+      if (this.busy > 0 && global.indexOf(action) < 0) return;
+      SFX.play('click'); this.haptic(evt);
+      switch (action) {
+        case 'menu': this.showMenu(); break;
+        case 'start': this.start(arg); break;
+        case 'reset':
+          if (this.mode === 'menu') { this.view.feedback = { type: 'info', text: 'Choose an activity first — there is nothing to reset on the menu.' }; this.draw(); }
+          else this.start(this.mode, true);
+          break;
+        case 'hint':
+          if (this.mode === 'chem') Chem.hint(); else if (this.mode === 'circuit') Circ.hint();
+          else { this.view.feedback = { type: 'info', text: 'Pick Activity 1 or 2 with the big buttons on the panel.' }; this.draw(); }
+          break;
+        case 'seated': this.toggleSeated(); break;
+        case 'gaze': this.cycleGaze(); break;
+        default:
+          if (this.mode === 'chem') Chem.handle(action, arg);
+          else if (this.mode === 'circuit') Circ.handle(action, arg);
+      }
+    },
+    haptic: function (evt) {
+      try {
+        const c = evt && evt.detail && evt.detail.cursorEl;
+        const tc = c && c.components && c.components['tracked-controls'];
+        const src = tc && tc.controller;
+        const act = src && src.gamepad && src.gamepad.hapticActuators && src.gamepad.hapticActuators[0];
+        if (act && act.pulse) act.pulse(0.35, 40);
+      } catch (e) { /* haptics are optional */ }
+    },
+
+    // ---------- comfort options ----------
+    toggleSeated: function () {
+      this.seated = !this.seated;
+      $('world').object3D.position.y = this.seated ? -0.22 : 0;
+      $('btnSeated').setAttribute('vl-button', { label: 'Seated mode · ' + (this.seated ? 'ON' : 'off') });
+      this.toast('info', this.seated ? 'Seated mode on: the lab is lowered by about 22 cm.' : 'Seated mode off: standard standing bench height.');
+    },
+    cycleGaze: function () {
+      this.gazeMode = { auto: 'on', on: 'off', off: 'auto' }[this.gazeMode];
+      this.updateGaze();
+      const t = { auto: 'Gaze select is AUTO: it turns on in VR when no controllers are detected.', on: 'Gaze select ON: look at a button for about 1.5 s to select it.', off: 'Gaze select OFF.' };
+      this.toast('info', t[this.gazeMode]);
+    },
+    updateGaze: function () {
+      const on = this.gazeMode === 'on' || (this.gazeMode === 'auto' && this.inVR && this.controllers.size === 0);
+      const g = $('gazeCursor');
+      g.setAttribute('raycaster', 'enabled', on);
+      g.object3D.visible = on;
+      this.gazeActive = on;
+      const lbl = { auto: 'Auto', on: 'ON', off: 'off' }[this.gazeMode];
+      $('btnGaze').setAttribute('vl-button', { label: 'Gaze select · ' + lbl + (on ? ' (active)' : '') });
+    },
+    toast: function (type, text) { this.view.feedback = { type: type, text: text }; this.draw(); },
+
+    // ---------- screens ----------
+    showMenu: function () {
+      this.cancelAnims();
+      this.mode = 'menu';
+      $('chem').object3D.visible = false; $('circuit').object3D.visible = false;
+      $('doneBanner').object3D.visible = false;
+      this.view = {
+        kind: 'menu', title: 'Virtual Laboratory', subtitle: 'Choose an activity',
+        status: 'Seated or standing · no walking needed · mistakes are safe here',
+        body: 'Practise two simple, safe simulated experiments at the bench in front of you.\n' +
+          '## Activity 1 — Mixing Liquids (Chemistry)\nWear goggles, pour coloured solutions into a flask, stir, and observe a simulated reaction.\n' +
+          '## Activity 2 — Simple Circuit (Physics)\nPlace a battery, bulb and switch, connect wires, and test the light.\n' +
+          '## How to select\nController laser + trigger · gaze for 1.5 s · or mouse click on desktop.',
+        feedback: null
+      };
+      this.setChoices([
+        { label: '1 · Mixing Liquids', action: 'start', arg: 'chem', color: '#0f7b6c' },
+        { label: '2 · Simple Circuit', action: 'start', arg: 'circuit', color: '#b5541a' }
+      ]);
+      this.draw();
+    },
+    start: function (mode, isReset) {
+      if (mode !== 'chem' && mode !== 'circuit') return;
+      this.cancelAnims();
+      this.mode = mode;
+      $('chem').object3D.visible = mode === 'chem';
+      $('circuit').object3D.visible = mode === 'circuit';
+      $('doneBanner').object3D.visible = false;
+      this.setChoices([]);
+      if (mode === 'chem') Chem.reset(); else Circ.reset();
+      const intro = mode === 'chem'
+        ? 'Welcome! Mix two simulated coloured solutions. Follow the steps above. Mistakes are safe here — you will see what happens and why.'
+        : 'Welcome! Build a simple simulated circuit. Pick each part from the front tray, then click where it belongs on the board.';
+      (mode === 'chem' ? Chem : Circ).render({ type: 'info', text: isReset ? 'Activity reset. ' + intro : intro });
+    },
+    complete: function (mode, mistakes) {
+      const notes = Array.from(mistakes).map(function (k) { return '• ' + NOTES[k]; });
+      const summary = mode === 'chem'
+        ? 'You wore eye protection, made measured pours, mixed, stirred and recorded what you observed.'
+        : 'You built a complete loop with a battery, switch and bulb, and saw how a switch controls current.';
+      this.view = {
+        kind: 'complete', title: 'Activity complete!', subtitle: mode === 'chem' ? 'Activity 1 · Mixing Liquids' : 'Activity 2 · Simple Circuit',
+        status: 'Well done — all steps finished (simulated demonstration)',
+        body: summary + '\n## Learning notes\n' + (notes.length ? notes.join('\n') : '• No mistakes this time. Next round, try a mistake on purpose to see what the simulation shows!'),
+        feedback: null
+      };
+      this.setChoices([
+        { label: 'Retry', action: 'start', arg: mode, color: '#1f6feb' },
+        { label: mode === 'chem' ? 'Try the circuit' : 'Try mixing liquids', action: 'start', arg: mode === 'chem' ? 'circuit' : 'chem', color: '#0f7b6c' },
+        { label: 'Menu', action: 'menu', arg: '', color: '#4b5563' }
+      ]);
+      $('doneBanner').object3D.visible = true;
+      SFX.play('done');
+      this.confetti();
+      this.draw();
+    },
+
+    setChoices: function (list) {
+      const xs = { 1: [0], 2: [-0.27, 0.27], 3: [-0.52, 0, 0.52] }[list.length] || [];
+      this.choices.forEach(function (b, i) {
+        const c = list[i];
+        if (!c) { b.object3D.visible = false; return; }
+        b.object3D.visible = true;
+        b.object3D.position.x = xs[i];
+        b.setAttribute('vl-button', { label: c.label, action: c.action, arg: c.arg || '', color: c.color || '#1f6feb' });
+      });
+      this.refreshClickables();
+    },
+
+    // keep only visible, enabled things selectable (raycasters otherwise hit hidden objects)
+    refreshClickables: function () {
+      const self = this;
+      clearTimeout(this._rcT);
+      this._rcT = setTimeout(function () {
+        let changed = false;
+        document.querySelectorAll('[vl-act]').forEach(function (el) {
+          let vis = el.dataset.off !== '1';
+          let o = el.object3D;
+          while (vis && o) { if (!o.visible) vis = false; o = o.parent; }
+          const has = el.classList.contains('clickable');
+          if (vis !== has) {
+            changed = true;
+            el.classList.toggle('clickable', vis);
+            if (!vis && el.components['vl-act']) el.components['vl-act'].unhover();
+          }
+        });
+        if (changed) document.querySelectorAll('[raycaster]').forEach(function (r) { if (r.components.raycaster) r.components.raycaster.refreshObjects(); });
+        self.scene.emit('vl-clickables');
+      }, 0);
+    },
+
+    // ---------- main panel drawing ----------
+    draw: function () {
+      const p = this.panel, ctx = p.ctx, W = p.W, H = p.H, v = this.view;
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#0d1520'; rr(ctx, 0, 0, W, H, 28); ctx.fill();
+      ctx.lineWidth = 5; ctx.strokeStyle = '#4a6fa5'; rr(ctx, 2.5, 2.5, W - 5, H - 5, 26); ctx.stroke();
+      // permanent disclaimer strip
+      ctx.fillStyle = '#ffc53d'; rr(ctx, 24, 18, W - 48, 50, 12); ctx.fill();
+      ctx.fillStyle = '#111111'; font(ctx, 23, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('SIMULATED EDUCATIONAL DEMONSTRATION — not real lab guidance or scientific measurement', W / 2, 44, W - 70);
+      // title row
+      ctx.textAlign = 'left'; ctx.fillStyle = '#ffffff'; font(ctx, 44, 800); ctx.fillText(v.title || '', 36, 108, W * 0.5);
+      ctx.textAlign = 'right'; ctx.fillStyle = '#7fdbff'; font(ctx, 29, 700); ctx.fillText(v.subtitle || '', W - 36, 110, W * 0.45);
+      if (v.status) { ctx.textAlign = 'left'; ctx.fillStyle = '#a9d6ff'; font(ctx, 24, 600); ctx.fillText(v.status, 36, 150, W - 72); }
+      ctx.fillStyle = '#2a3b52'; ctx.fillRect(36, 172, W - 72, 3);
+      let y = 186;
+      const bottom = H - 122;   // space reserved for the 3D buttons
+      if (v.kind === 'task') {
+        v.steps.forEach(function (s, i) {
+          const cur = i === v.current;
+          font(ctx, cur ? 29 : 27, cur ? 800 : 500);
+          const lines = wrap(ctx, (i + 1) + '. ' + s.text, W - 160);
+          const rowH = Math.max(44, lines.length * 34 + 10);
+          if (cur) { ctx.fillStyle = 'rgba(255,214,10,0.13)'; rr(ctx, 30, y, W - 60, rowH, 10); ctx.fill(); }
+          const bx = 44, by = y + 7, bs = 30;
+          if (s.done) {
+            ctx.fillStyle = '#2ec27e'; rr(ctx, bx, by, bs, bs, 7); ctx.fill();
+            ctx.strokeStyle = '#06260f'; ctx.lineWidth = 5; ctx.beginPath();
+            ctx.moveTo(bx + 6, by + 16); ctx.lineTo(bx + 13, by + 23); ctx.lineTo(bx + 25, by + 8); ctx.stroke();
+          } else {
+            ctx.lineWidth = cur ? 5 : 3; ctx.strokeStyle = cur ? '#ffd60a' : '#6b7c93'; rr(ctx, bx, by, bs, bs, 7); ctx.stroke();
+          }
+          ctx.fillStyle = s.done ? '#8fa6bf' : cur ? '#ffffff' : '#c3cfdb';
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          lines.forEach(function (l, j) { ctx.fillText(l, 92, y + 22 + j * 34); });
+          y += rowH + 2;
+        });
+      } else if (v.body) {
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        v.body.split('\n').forEach(function (para) {
+          const head = para.indexOf('## ') === 0;
+          font(ctx, head ? 29 : 27, head ? 800 : 500);
+          ctx.fillStyle = head ? '#ffd60a' : '#e6edf5';
+          const lines = wrap(ctx, head ? para.slice(3) : para, W - 100);
+          if (head) y += 6;
+          lines.forEach(function (l) { if (y < bottom - 20) ctx.fillText(l, 44, y + 17); y += 34; });
+        });
+      }
+      // feedback box
+      const fb = v.feedback, fy = y + 8, fh = bottom - fy;
+      if (fb && fh > 70) {
+        const col = { info: '#3a86ff', success: '#2ec27e', warn: '#ffb000' }[fb.type] || '#3a86ff';
+        const head = { info: 'GUIDE', success: 'WELL DONE', warn: "HARMLESS MISTAKE — HERE'S WHAT HAPPENED" }[fb.type] || 'GUIDE';
+        ctx.fillStyle = '#172231'; rr(ctx, 30, fy, W - 60, fh, 14); ctx.fill();
+        ctx.fillStyle = col; rr(ctx, 30, fy, 14, fh, 7); ctx.fill();
+        ctx.textAlign = 'left'; ctx.fillStyle = col; font(ctx, 23, 800); ctx.fillText(head, 62, fy + 24);
+        let fs = 28, lines;
+        for (; fs >= 20; fs -= 2) { font(ctx, fs, 600); lines = wrap(ctx, fb.text, W - 120); if (lines.length * fs * 1.25 <= fh - 50) break; }
+        ctx.fillStyle = '#ffffff';
+        lines.forEach(function (l, j) { ctx.fillText(l, 62, fy + 58 + j * fs * 1.25); });
+      }
+      p.commit();
+      this.refreshClickables();
+    },
+
+    // ---------- animation helpers ----------
+    tween: function (dur, fn, done) { this.tweens.push({ t: 0, dur: dur, fn: fn, done: done }); },
+    seq: function (steps, done) {   // steps: [[dur, fn], ...]
+      const self = this; let i = 0;
+      (function next() {
+        if (i >= steps.length) { if (done) done(); return; }
+        const s = steps[i++]; self.tween(s[0], s[1], next);
+      })();
+    },
+    cancelAnims: function () { this.tweens.length = 0; this.busy = 0; },
+    tick: function (t, dt) {
+      this.time = t;
+      const list = this.tweens.slice();
+      for (let i = 0; i < list.length; i++) {
+        const tw = list[i];
+        if (this.tweens.indexOf(tw) < 0) continue;
+        tw.t += dt; const p = Math.min(1, tw.t / tw.dur);
+        tw.fn(ease(p), p);
+        if (p >= 1) { this.tweens.splice(this.tweens.indexOf(tw), 1); if (tw.done) tw.done(); }
+      }
+      if (this.mode === 'chem') Chem.tick(t, dt); else if (this.mode === 'circuit') Circ.tick(t, dt);
+      const b = $('doneBanner'); if (b.object3D.visible) b.object3D.position.y = 2.24 + Math.sin(t * 2.2) * 0.015;
+      for (let i = this.fx.length - 1; i >= 0; i--) {
+        const f = this.fx[i]; f.life -= dt;
+        f.m.position.addScaledVector(f.v, dt); f.v.y -= 1.4 * dt; f.m.rotation.x += 4 * dt; f.m.rotation.z += 3 * dt;
+        if (f.life <= 0) { f.m.parent.remove(f.m); f.m.material.dispose(); this.fx.splice(i, 1); }
+      }
+    },
+    confetti: function () {
+      const root = $('world').object3D, geo = this._cg || (this._cg = new THREE.PlaneGeometry(0.03, 0.018));
+      const cols = [0xffd60a, 0x2ec27e, 0x3a86ff, 0xff5d73, 0xc77dff];
+      for (let i = 0; i < 36; i++) {
+        const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: cols[i % cols.length], side: THREE.DoubleSide }));
+        m.position.set((Math.random() - 0.5) * 1.2, 2.2, -1.7);
+        root.add(m);
+        this.fx.push({ m: m, v: new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.6 + Math.random() * 0.8, 0.3 + Math.random() * 0.4), life: 2.2 });
+      }
+    }
+  };
+
+  // =====================================================================
+  //   ACTIVITY 1 — MIXING LIQUIDS (simulated)
+  // =====================================================================
+  const COL = { A: '#1e6bff', B: '#ffd23f', C: '#e63946', AB: '#2bb24c', AC: '#7b3fbf', BC: '#ff7f2a', ABC: '#6b4a2b', R: '#14d98a' };
+  const LIQ = { A: 'Solution A (blue)', B: 'Solution B (yellow)', C: 'Solution C (red)' };
+  const POUR = 25, CAP = 75;   // mL, simulated
+  const FLASK = { x: 0.22, y: 0.1, z: 0 };
+  const ROD = { x: 0.45, y: 0.02, z: 0.17 };
+
+  const Chem = {
+    steps: [
+      'Put on the safety goggles (click them, far left).',
+      'Pick up Solution A (blue), then click the flask to pour.',
+      'Pick up Solution B (yellow) and pour it into the flask.',
+      'Click the glass stirring rod to mix, then observe.',
+      'Answer on the panel: what did you observe?'
+    ],
+    hints: [
+      'The orange goggles are on the far left of the bench. Point at them and select.',
+      'Click the blue beaker labelled A — it lifts up. Then click the mixing flask on the right.',
+      'Click beaker B (yellow), then the flask. Red C is not part of this task.',
+      'The glass stirring rod lies at the front right of the bench, in front of the flask.',
+      'Choose the answer on the panel that matches how the flask looks now.'
+    ],
+    home: { A: [-0.32, 0.07, -0.12], B: [-0.16, 0.07, -0.12], C: [0.0, 0.07, -0.12] },
+
+    build: function (root) {
+      const self = this;
+      this.root = root;
+      // --- safety goggles ---
+      const g = this.goggles = E(root, { id: 'goggles', position: '-0.5 0.04 0.1', rotation: '-50 0 0', geometry: hitbox(0.2, 0.09, 0.08), material: HIT, 'vl-act': { action: 'goggles' } });
+      [-0.045, 0.045].forEach(function (x) {
+        E(g, { geometry: { primitive: 'torus', radius: 0.032, radiusTubular: 0.008, segmentsRadial: 8, segmentsTubular: 24 }, material: mat('#ff9f1c'), position: x + ' 0 0' });
+        E(g, { geometry: { primitive: 'circle', radius: 0.031, segments: 24 }, material: glass({ color: '#bfe3ff', opacity: 0.45 }), position: x + ' 0 0' });
+      });
+      E(g, { geometry: { primitive: 'box', width: 0.03, height: 0.01, depth: 0.01 }, material: mat('#ff9f1c'), position: '0 0.008 0' });
+      E(g, { geometry: { primitive: 'box', width: 0.2, height: 0.012, depth: 0.004 }, material: mat('#222831'), position: '0 0 -0.012' });
+      this.gogglesTag = tag(root, 'Safety goggles', '-0.5 0.006 0.2');
+
+      // --- source beakers ---
+      this.beakers = {}; this.liq = {};
+      ['A', 'B', 'C'].forEach(function (k) {
+        const h = self.home[k];
+        const b = self.beakers[k] = E(root, { id: 'beaker' + k, position: h.join(' '), geometry: hitbox(0.11, 0.15, 0.11), material: HIT, 'vl-act': { action: 'pick', arg: k } });
+        E(b, { geometry: { primitive: 'cylinder', radius: 0.048, height: 0.13, openEnded: true, segmentsRadial: 24 }, material: glass() });
+        E(b, { geometry: { primitive: 'torus', radius: 0.048, radiusTubular: 0.003, segmentsTubular: 32 }, material: glass({ opacity: 0.6 }), position: '0 0.065 0', rotation: '90 0 0' });
+        E(b, { geometry: { primitive: 'cylinder', radius: 0.048, height: 0.004, segmentsRadial: 24 }, material: glass({ opacity: 0.5 }), position: '0 -0.064 0' });
+        self.liq[k] = E(b, { geometry: { primitive: 'cylinder', radius: 0.043, height: 0.085, segmentsRadial: 24 }, material: mat(COL[k], { emissive: COL[k], emissiveIntensity: 0.12, roughness: 0.3 }), position: '0 -0.02 0' });
+        // printed letter on the glass
+        E(b, { position: '0 0.03 0.05', 'vl-text': { value: k, width: 0.04, height: 0.04, size: 0.03, bg: 'rgba(255,255,255,0.9)', color: '#111111', radius: 0.02, ppm: 1500 } });
+        tag(root, LIQ[k] + '\n(simulated)', h[0] + ' 0.006 -0.02', { t: { width: 0.155, height: 0.06, size: 0.013 } });
+      });
+
+      // --- Erlenmeyer mixing flask ---
+      const f = this.flask = E(root, { id: 'flask', position: FLASK.x + ' ' + FLASK.y + ' ' + FLASK.z, geometry: hitbox(0.17, 0.22, 0.17), material: HIT, 'vl-act': { action: 'flask' } });
+      E(f, { geometry: { primitive: 'cone', radiusTop: 0.024, radiusBottom: 0.072, height: 0.14, openEnded: true, segmentsRadial: 28 }, material: glass(), position: '0 -0.03 0' });
+      E(f, { geometry: { primitive: 'circle', radius: 0.072, segments: 28 }, material: glass({ opacity: 0.45 }), position: '0 -0.099 0', rotation: '-90 0 0' });
+      E(f, { geometry: { primitive: 'cylinder', radius: 0.024, height: 0.06, openEnded: true, segmentsRadial: 20 }, material: glass(), position: '0 0.07 0' });
+      [0.25, 0.5, 0.75].forEach(function (fr) {   // graduation marks (25/50/75 mL, simulated)
+        const yy = -0.1 + 0.14 * fr * 0.7;
+        const r = 0.072 - 0.048 * (fr * 0.7);
+        E(f, { geometry: { primitive: 'box', width: 0.03, height: 0.003, depth: 0.002 }, material: mat('#ffffff', { emissive: '#ffffff', emissiveIntensity: 0.4 }), position: '0 ' + yy.toFixed(3) + ' ' + (r + 0.002).toFixed(3) });
+      });
+      this.flaskLiq = E(f, { geometry: { primitive: 'cone', radiusTop: 0.06, radiusBottom: 0.068, height: 0.01, segmentsRadial: 28 }, material: mat('#ffffff', { roughness: 0.25, emissiveIntensity: 0.15 }), position: '0 -0.095 0', visible: false });
+      this.bubbles = [];
+      for (let i = 0; i < 8; i++) {
+        this.bubbles.push(E(f, { geometry: { primitive: 'sphere', radius: 0.0055, segmentsWidth: 8, segmentsHeight: 6 }, material: mat('#ffffff', { opacity: 0.85, transparent: true, emissive: '#ffffff', emissiveIntensity: 0.4 }), visible: false }));
+      }
+      // stream used while pouring
+      this.stream = E(root, { geometry: { primitive: 'cylinder', radius: 0.005, height: 0.12, segmentsRadial: 8 }, material: mat('#ffffff', { opacity: 0.85, transparent: true }), visible: false });
+      this.flaskTag = tag(root, 'Mixing flask', FLASK.x + ' 0.006 0.115', { t: { width: 0.18, height: 0.06, size: 0.0135 } });
+
+      // --- thermometer probe + simulated digital readout ---
+      E(f, { geometry: { primitive: 'cylinder', radius: 0.0035, height: 0.2, segmentsRadial: 8 }, material: mat('#d9d9d9', { metalness: 0.6 }), position: '0.012 0.03 -0.005', rotation: '0 0 -6' });
+      const disp = E(root, { position: '0.42 0.085 -0.27', rotation: '-12 -18 0' });
+      E(disp, { geometry: { primitive: 'box', width: 0.2, height: 0.13, depth: 0.03 }, material: mat('#26313f') });
+      this.tempText = E(disp, { position: '0 0 0.016', 'vl-text': { value: '', width: 0.185, height: 0.115, size: 0.02, bg: '#c9f7d3', color: '#0b2614', radius: 0.006, ppm: 1400 } });
+      E(disp, { geometry: { primitive: 'cylinder', radius: 0.0025, height: 0.25, segmentsRadial: 6 }, material: mat('#333333'), position: '-0.11 -0.04 0.06', rotation: '70 0 60' });
+
+      // --- glass stirring rod in a holder ---
+      // lies flat at the front so it never hides other instruments from the user's viewpoint
+      [0.36, 0.54].forEach(function (x) { E(root, { geometry: { primitive: 'box', width: 0.03, height: 0.012, depth: 0.04 }, material: mat('#4b5563'), position: x + ' 0.006 ' + ROD.z }); });
+      const rod = this.rod = E(root, { id: 'rod', position: ROD.x + ' ' + ROD.y + ' ' + ROD.z, rotation: '0 0 90', geometry: hitbox(0.06, 0.27, 0.07), material: HIT, 'vl-act': { action: 'stir' } });
+      E(rod, { geometry: { primitive: 'cylinder', radius: 0.0075, height: 0.25, segmentsRadial: 10 }, material: glass({ opacity: 0.85, color: '#e8f6ff' }) });
+      tag(root, 'Glass stirring rod', ROD.x + ' 0.006 0.245', { t: { width: 0.16, height: 0.04 } });
+
+      // --- waste beaker ---
+      const w = this.waste = E(root, { id: 'waste', position: '0.58 0.065 -0.1', geometry: hitbox(0.12, 0.14, 0.12), material: HIT, 'vl-act': { action: 'waste' } });
+      E(w, { geometry: { primitive: 'cylinder', radius: 0.052, height: 0.12, openEnded: true, segmentsRadial: 24 }, material: glass({ color: '#c7ccd4', opacity: 0.4 }) });
+      E(w, { geometry: { primitive: 'cylinder', radius: 0.047, height: 0.035, segmentsRadial: 24 }, material: mat('#6b6f76'), position: '0 -0.04 0' });
+      E(w, { position: '0 0.025 0.054', 'vl-text': { value: 'WASTE', width: 0.08, height: 0.03, size: 0.017, bg: '#ffffff', color: '#111111', radius: 0.004, ppm: 1500 } });
+      tag(root, 'Waste beaker\n(empties the flask)', '0.58 0.006 0.005', { t: { width: 0.17, height: 0.06, size: 0.013 } });
+
+      // --- decorative instruments (not interactive) ---
+      const gc = E(root, { position: '-0.6 0.0 -0.24' });
+      E(gc, { geometry: { primitive: 'cylinder', radius: 0.022, height: 0.24, openEnded: true, segmentsRadial: 16 }, material: glass(), position: '0 0.13 0' });
+      E(gc, { geometry: { primitive: 'cylinder', radius: 0.045, height: 0.012, segmentsRadial: 16 }, material: mat('#4b5563'), position: '0 0.006 0' });
+      for (let i = 1; i < 6; i++) E(gc, { geometry: { primitive: 'box', width: 0.012, height: 0.002, depth: 0.002 }, material: mat('#ffffff'), position: '0 ' + (0.03 + i * 0.035) + ' 0.023' });
+      const rack = E(root, { position: '-0.2 0 -0.28' });
+      E(rack, { geometry: { primitive: 'box', width: 0.26, height: 0.012, depth: 0.06 }, material: mat('#8b5e34'), position: '0 0.06 0' });
+      E(rack, { geometry: { primitive: 'box', width: 0.26, height: 0.012, depth: 0.06 }, material: mat('#8b5e34'), position: '0 0.006 0' });
+      ['#9ad1ff', '#ffe08a', '#ffb3c1', '#c8f7c5'].forEach(function (c, i) {
+        E(rack, { geometry: { primitive: 'cylinder', radius: 0.012, height: 0.12, openEnded: true, segmentsRadial: 12 }, material: glass(), position: (-0.09 + i * 0.06) + ' 0.07 0' });
+        E(rack, { geometry: { primitive: 'cylinder', radius: 0.0105, height: 0.04, segmentsRadial: 12 }, material: mat(c), position: (-0.09 + i * 0.06) + ' 0.035 0' });
+      });
+    },
+
+    reset: function () {
+      const s = this.s = { goggles: false, held: null, counts: { A: 0, B: 0, C: 0 }, vol: 0, reacted: false, temp: 22.0, answered: false, complete: false, mistakes: new Set(), bubbleT: 0, color: null };
+      const self = this;
+      this.goggles.object3D.visible = true; this.goggles.object3D.position.set(-0.5, 0.04, 0.1);
+      this.gogglesTag.object3D.visible = true;
+      ['A', 'B', 'C'].forEach(function (k) { const o = self.beakers[k].object3D; o.position.fromArray(self.home[k]); o.rotation.set(0, 0, 0); });
+      this.rod.object3D.position.set(ROD.x, ROD.y, ROD.z); this.rod.object3D.rotation.set(0, 0, Math.PI / 2);
+      this.stream.object3D.visible = false;
+      this.setFill(0, null);
+      this.bubbles.forEach(function (b) { b.object3D.visible = false; });
+      this.updateReadouts();
+      VL.setChoices([]);
+    },
+
+    stepDone: function () {
+      const s = this.s, noC = s.counts.C === 0;
+      return [s.goggles, s.counts.A > 0 && noC, s.counts.B > 0 && noC, s.reacted, s.answered];
+    },
+    render: function (fb) {
+      const s = this.s, done = this.stepDone();
+      let cur = done.indexOf(false); if (cur < 0) cur = done.length;
+      VL.view = {
+        kind: 'task', title: 'Virtual Laboratory', subtitle: 'Activity 1 · Mixing Liquids',
+        status: 'Goggles ' + (s.goggles ? 'ON' : 'off') + '  ·  Holding ' + (s.held ? 'Solution ' + s.held : 'nothing') + '  ·  Flask ' + s.vol + ' mL (simulated)',
+        steps: this.steps.map(function (t, i) { return { text: t, done: done[i] }; }), current: cur,
+        feedback: fb || VL.view.feedback
+      };
+      if (fb) SFX.play(fb.type === 'success' ? 'good' : fb.type === 'warn' ? 'warn' : null);
+      VL.draw();
+    },
+    hint: function () {
+      const s = this.s, done = this.stepDone();
+      let cur = done.indexOf(false);
+      let text = cur < 0 ? 'All done!' : this.hints[cur];
+      if (s.counts.C > 0) text = 'The flask contains Solution C. Click the grey waste beaker (back right) to empty it, then pour A and B.';
+      else if (s.vol >= CAP) text = 'The flask is at its simulated fill limit. Stir, or empty it into the waste beaker.';
+      this.render({ type: 'info', text: 'Hint — ' + text });
+    },
+
+    handle: function (action, arg) {
+      const s = this.s;
+      if (s.complete) { this.renderDoneNote(); return; }
+      switch (action) {
+        case 'goggles':
+          if (!s.goggles) {
+            s.goggles = true; VL.busy++;
+            const o = this.goggles.object3D, self = this;
+            VL.tween(0.45, function (p) { o.position.y = lerp(0.04, 0.35, p); o.scale.setScalar(1 - 0.8 * p); }, function () {
+              o.visible = false; o.scale.setScalar(1); self.gogglesTag.object3D.visible = false; VL.busy--;
+              if (s.answered) { self.finish(); return; }
+              self.render({ type: 'success', text: 'Goggles on. Putting on eye protection before touching any liquid is the habit real labs expect (simulated reminder).' });
+            });
+          }
+          break;
+        case 'pick': this.pick(arg); break;
+        case 'flask':
+          if (!s.held) this.render({ type: 'info', text: 'Pick up a solution first: click beaker A, B or C, then click the flask.' });
+          else this.pour(s.held);
+          break;
+        case 'stir': this.stir(); break;
+        case 'waste': this.empty(); break;
+        case 'answer': this.answer(arg); break;
+      }
+    },
+    renderDoneNote: function () { VL.toast('info', 'This activity is complete. Use Retry on the panel or Reset activity on the right to practise again.'); },
+
+    pick: function (k) {
+      const s = this.s, self = this;
+      if (s.held === k) {
+        this.lower(k); s.held = null;
+        this.render({ type: 'info', text: 'Put Solution ' + k + ' back on the bench.' });
+        return;
+      }
+      if (s.held) this.lower(s.held);
+      s.held = k;
+      const o = this.beakers[k].object3D;
+      VL.tween(0.2, function (p) { o.position.y = lerp(self.home[k][1], self.home[k][1] + 0.05, p); });
+      const extra = k === 'C' ? ' Check the steps first: this task uses A and B.' : '';
+      this.render({ type: 'info', text: 'Holding ' + LIQ[k] + '. Now click the mixing flask to pour ' + POUR + ' mL (simulated).' + extra });
+    },
+    lower: function (k) {
+      const o = this.beakers[k].object3D, y0 = o.position.y, h = this.home[k];
+      VL.tween(0.2, function (p) { o.position.y = lerp(y0, h[1], p); });
+    },
+
+    pour: function (k) {
+      const s = this.s, self = this;
+      if (s.reacted) { this.render({ type: 'info', text: 'The flask already holds the finished, stirred mixture. Empty it into the waste beaker if you want a fresh attempt.' }); return; }
+      if (s.vol + POUR > CAP) {
+        s.mistakes.add('overfill');
+        this.render({ type: 'warn', text: 'Pour stopped: the flask would be over-full (simulated limit ' + CAP + ' mL). Rule of thumb: keep glassware below about two-thirds full. Stir what is there, or empty it into the waste beaker.' });
+        return;
+      }
+      const noGoggles = !s.goggles && !s.mistakes.has('no-goggles');
+      if (!s.goggles) s.mistakes.add('no-goggles');
+      VL.busy++;
+      const o = this.beakers[k].object3D, st = this.stream.object3D;
+      const from = o.position.clone();
+      const to = new THREE.Vector3(FLASK.x - 0.1, 0.27, FLASK.z);
+      const vol0 = s.vol, col0 = s.color;
+      s.counts[k]++; s.vol += POUR;
+      const colTarget = this.mixColor();
+      this.stream.setAttribute('material', 'color', COL[k]);
+      VL.seq([
+        [0.45, function (p) { o.position.lerpVectors(from, to, p); }],
+        [0.3, function (p) { o.rotation.z = -1.25 * p; }],
+        [0.6, function (p, raw) {
+          st.visible = true; st.position.set(FLASK.x - 0.035, 0.24 - 0.04, FLASK.z);
+          st.scale.y = 0.6 + Math.sin(raw * Math.PI) * 0.4;
+          self.setFill(lerp(vol0, s.vol, p), self.lerpColor(col0 || colTarget, colTarget, p));
+        }],
+        [0.3, function (p) { st.visible = false; o.rotation.z = -1.25 * (1 - p); }],
+        [0.45, function (p) { o.position.lerpVectors(to, new THREE.Vector3(self.home[k][0], self.home[k][1], self.home[k][2]), p); }]
+      ], function () {
+        s.held = null; s.color = colTarget; VL.busy--;
+        self.afterPour(k, noGoggles);
+      });
+    },
+    afterPour: function (k, noGoggles) {
+      const s = this.s, c = s.counts;
+      let fb;
+      if (k === 'C') {
+        s.mistakes.add('wrong-liquid');
+        const look = c.A && c.B ? 'muddy brown' : c.A ? 'purple' : c.B ? 'orange' : 'red';
+        fb = { type: 'warn', text: 'Solution C (red) went in, so the flask now looks ' + look + ' in this simulation. The task uses A and B only. No harm done — click the grey waste beaker to empty the flask and try again.' };
+      } else if (c.C > 0) {
+        fb = { type: 'warn', text: 'The flask still contains Solution C, so this will not reach the target colour. Empty it into the waste beaker and retry with A then B.' };
+      } else if (noGoggles) {
+        fb = { type: 'warn', text: 'Poured — but without goggles. Nothing can be harmed here, yet in a real lab eye protection goes on before handling liquids. Click the goggles on the left, then carry on.' };
+      } else if (c.A && c.B) {
+        const shade = c.A !== c.B ? ' The shade leans toward the solution you added more of — that is fine.' : '';
+        fb = { type: 'success', text: 'Blue + yellow → green (simulated colour model).' + shade + ' Next: click the stirring rod.' };
+      } else if (k === 'A') {
+        fb = { type: 'success', text: 'Poured ' + POUR + ' mL of Solution A (simulated). The flask shows blue. Now pick up Solution B.' };
+      } else {
+        fb = { type: 'info', text: 'You added Solution B first. Order does not matter in this simulation — now add Solution A.' };
+      }
+      this.updateReadouts();
+      this.render(fb);
+    },
+
+    stir: function () {
+      const s = this.s, self = this;
+      if (s.vol === 0) { this.render({ type: 'info', text: 'Nothing to stir — the flask is empty. Pour Solution A first.' }); return; }
+      if (s.held) { this.lower(s.held); s.held = null; }
+      VL.busy++;
+      const o = this.rod.object3D, from = o.position.clone();
+      const over = new THREE.Vector3(FLASK.x, 0.2, FLASK.z);
+      VL.seq([
+        [0.45, function (p) { o.position.lerpVectors(from, over, p); o.rotation.z = (Math.PI / 2) * (1 - p); }],
+        [1.2, function (p, raw) { const a = raw * Math.PI * 6; o.position.set(FLASK.x + Math.cos(a) * 0.012, 0.19, FLASK.z + Math.sin(a) * 0.012); }],
+        [0.45, function (p) { o.position.lerpVectors(over, from, p); o.rotation.z = (Math.PI / 2) * p; }]
+      ], function () { VL.busy--; self.afterStir(); });
+    },
+    afterStir: function () {
+      const s = this.s, c = s.counts;
+      if (c.C > 0) { this.render({ type: 'warn', text: 'Stirring mixes evenly, but it cannot remove Solution C. Empty the flask into the waste beaker and retry with A + B.' }); return; }
+      if (!(c.A && c.B)) { this.render({ type: 'info', text: 'Stirred. With only one solution there is nothing new to observe yet — add the other one.' }); return; }
+      if (s.reacted) { this.render({ type: 'info', text: 'Already mixed. Answer the question on the panel.' }); return; }
+      s.reacted = true;
+      const self = this, c0 = s.color, t0 = s.temp;
+      s.bubbleT = 3.5;
+      SFX.play('fizz');
+      VL.tween(2.0, function (p) {
+        self.setFill(s.vol, self.lerpColor(c0, COL.R, p));
+        s.temp = lerp(t0, 26.5, p); self.updateReadouts();
+      }, function () { s.color = COL.R; });
+      VL.setChoices([
+        { label: 'Green + bubbles + warm-up', action: 'answer', arg: 'green', color: '#1f6feb' },
+        { label: 'Stayed blue', action: 'answer', arg: 'blue', color: '#1f6feb' },
+        { label: 'Turned brown', action: 'answer', arg: 'brown', color: '#1f6feb' }
+      ]);
+      this.render({ type: 'success', text: 'Simulated reaction: the mix turns a brighter green, tiny bubbles rise and the display shows a small warm-up. These effects are illustrative, not real chemistry. Now answer the question below.' });
+    },
+
+    empty: function () {
+      const s = this.s, self = this;
+      if (s.vol === 0) { this.render({ type: 'info', text: 'The flask is already empty.' }); return; }
+      VL.busy++;
+      const v0 = s.vol, col = s.color, t0 = s.temp;
+      VL.tween(0.6, function (p) { self.setFill(lerp(v0, 0, p), col); s.temp = lerp(t0, 22, p); self.updateReadouts(); }, function () {
+        s.counts = { A: 0, B: 0, C: 0 }; s.vol = 0; s.reacted = false; s.color = null; s.temp = 22; s.bubbleT = 0;
+        self.bubbles.forEach(function (b) { b.object3D.visible = false; });
+        self.setFill(0, null); self.updateReadouts();
+        VL.setChoices([]); VL.busy--;
+        self.render({ type: 'info', text: 'Flask emptied into the waste beaker (simulated). Start again with Solution A.' });
+      });
+    },
+
+    answer: function (a) {
+      const s = this.s;
+      if (a === 'green') {
+        s.answered = true; VL.setChoices([]);
+        if (!s.goggles) { this.render({ type: 'warn', text: 'Correct! One step left: put on the goggles to finish. In a real lab they would go on before anything else.' }); return; }
+        this.finish();
+        return;
+      }
+      s.mistakes.add('chem-quiz');
+      const why = a === 'blue'
+        ? 'It was blue only after Solution A. Adding yellow B shifted it to green, and stirring added bubbles and a small warm-up.'
+        : 'In this simulation brown appears only when all three solutions are mixed. Your flask held A + B.';
+      this.render({ type: 'warn', text: 'Not quite. ' + why + ' Look at the flask and try again.' });
+    },
+    finish: function () { this.s.complete = true; VL.complete('chem', this.s.mistakes); },
+
+    // ---------- visuals ----------
+    mixColor: function () {
+      const c = this.s.counts, keys = ['A', 'B', 'C'].filter(function (k) { return c[k] > 0; });
+      if (!keys.length) return null;
+      if (keys.length === 1) return COL[keys[0]];
+      if (keys.length === 3) return COL.ABC;
+      const base = new THREE.Color(COL[keys.join('')]);
+      const r = c[keys[0]] / (c[keys[0]] + c[keys[1]]);
+      if (r > 0.5) base.lerp(new THREE.Color(COL[keys[0]]), (r - 0.5) * 0.9);
+      if (r < 0.5) base.lerp(new THREE.Color(COL[keys[1]]), (0.5 - r) * 0.9);
+      return '#' + base.getHexString();
+    },
+    lerpColor: function (a, b, p) {
+      if (!a) return b; if (!b) return a;
+      return '#' + new THREE.Color(a).lerp(new THREE.Color(b), p).getHexString();
+    },
+    setFill: function (vol, color) {
+      const e = this.flaskLiq;
+      if (vol <= 0.5) { e.object3D.visible = false; return; }
+      const fr = vol / 100;                 // fraction of a 100 mL flask
+      const h = 0.14 * fr;
+      const rTop = 0.068 - 0.046 * (h / 0.14);
+      e.setAttribute('geometry', { primitive: 'cone', radiusTop: rTop, radiusBottom: 0.068, height: h, segmentsRadial: 28 });
+      e.object3D.position.y = -0.099 + h / 2;
+      e.object3D.visible = true;
+      if (color) { const m = meshMat(e); if (m) { m.color.set(color); m.emissive.set(color); } }
+    },
+    updateReadouts: function () {
+      const s = this.s;
+      setText(this.tempText, 'TEMPERATURE\n' + s.temp.toFixed(1) + ' °C\n(simulated display)');
+      setText(this.flaskTag, 'Mixing flask · ' + s.vol + ' mL\n(simulated volume)');
+    },
+    tick: function (t, dt) {
+      const s = this.s; if (!s) return;
+      if (s.bubbleT > 0) {
+        s.bubbleT -= dt;
+        const h = 0.14 * s.vol / 100;
+        this.bubbles.forEach(function (b, i) {
+          const o = b.object3D, ph = (t * 0.9 + i / 8) % 1;
+          o.visible = s.bubbleT > 0;
+          o.position.set(Math.cos(i * 2.3) * 0.03, -0.095 + ph * h, Math.sin(i * 2.3) * 0.03);
+        });
+      }
+    }
+  };
+
+  // =====================================================================
+  //   ACTIVITY 2 — SIMPLE CIRCUIT (simulated)
+  // =====================================================================
+  const XL = -0.22, XR = 0.22, ZT = -0.22, ZB = 0.1, ZM = -0.06;
+  const PART = { battery: 'battery', bulb: 'bulb', switch: 'switch', extra: 'extra wire' };
+  const SLOT_NAME = { battery: 'BATTERY holder', bulb: 'BULB socket', switch: 'SWITCH slot', bypass: 'BYPASS marker' };
+  const TRAY = { battery: [-0.27, 0.048, 0.24], bulb: [-0.09, 0.07, 0.24], switch: [0.09, 0.045, 0.24], extra: [0.27, 0.035, 0.24] };
+  const SLOT = { battery: [XL, ZM], switch: [0, ZT], bulb: [XR, ZM], bypass: [0.335, ZM] };
+  const WIRES = [
+    [[XL, -0.12], [XL, ZT], [-0.06, ZT]],
+    [[0.06, ZT], [XR, ZT], [XR, -0.1]],
+    [[XR, -0.02], [XR, ZB], [XL, ZB], [XL, 0.0]]
+  ];
+
+  const Circ = {
+    stepText: function (i) {
+      const s = this.s;
+      return [
+        'Place the battery: click it on the front tray, then its holder.',
+        'Place the bulb into the BULB socket.',
+        'Place the switch into the SWITCH slot.',
+        'Connect the 3 wire gaps (click each pulsing gap) — ' + s.wires.filter(Boolean).length + '/3',
+        'Close the switch (click its red lever) to light the bulb.',
+        'Open the switch again and watch the bulb.',
+        'Answer on the panel: why did the bulb go out?'
+      ][i];
+    },
+    hints: [
+      'The battery is the black cylinder on the parts tray at the front. Click it, then click the orange BATTERY outline on the left of the board.',
+      'Click the bulb on the tray, then the yellow BULB outline on the right of the board.',
+      'Click the switch on the tray, then the purple SWITCH outline at the back of the board.',
+      'Click each pulsing grey gap on the board to lay a copper wire.',
+      'Click the red switch lever to close it.',
+      'Click the switch lever again to open it.',
+      'Pick the answer that explains why the light stopped.'
+    ],
+
+    build: function (root) {
+      const self = this;
+      this.root = root;
+      // board + tray
+      E(root, { geometry: { primitive: 'box', width: 0.72, height: 0.02, depth: 0.42 }, material: mat('#1d4e3a', { roughness: 0.85 }), position: '0 0.01 ' + ZM });
+      E(root, { geometry: { primitive: 'box', width: 0.76, height: 0.02, depth: 0.14 }, material: mat('#3a4656', { roughness: 0.9 }), position: '0 0.01 0.25' });
+      tag(root, 'PARTS TRAY', '0 0.022 0.31', { rot: '-70 0 0', t: { width: 0.16, height: 0.025, size: 0.014, bg: 'rgba(0,0,0,0)', color: '#c3cfdb' } });
+
+      // slots (drop targets)
+      const slotCfg = {
+        battery: { w: 0.08, d: 0.15, col: '#ff9f1c', txt: 'BATTERY' },
+        switch: { w: 0.15, d: 0.08, col: '#c77dff', txt: 'SWITCH' },
+        bulb: { w: 0.09, d: 0.09, col: '#ffd60a', txt: 'BULB' },
+        bypass: { w: 0.04, d: 0.12, col: '#ff5d73', txt: '' }
+      };
+      this.slots = {};
+      Object.keys(slotCfg).forEach(function (k) {
+        const c = slotCfg[k], p = SLOT[k];
+        const sl = self.slots[k] = E(root, { id: 'slot-' + k, position: p[0] + ' 0.035 ' + p[1], geometry: hitbox(c.w + 0.01, 0.03, c.d + 0.01), material: HIT, 'vl-act': { action: 'slot', arg: k, hoverScale: 1.04 } });
+        E(sl, { position: '0 -0.013 0', rotation: '-90 0 0', 'vl-text': { value: c.txt, width: c.w, height: c.d, size: 0.016, bg: 'rgba(255,255,255,0.08)', border: c.col, color: c.col, radius: 0.008, ppm: 1500, pad: 0.004 } });
+      });
+      this.bypassTag = tag(root, 'BYPASS\n(optional test)', '0.43 0.006 ' + ZM, { rot: '-90 0 0', t: { width: 0.11, height: 0.055, size: 0.013, color: '#ff8fa0' } });
+
+      // wires (click gaps to connect)
+      this.wireEls = WIRES.map(function (pts, i) {
+        let minX = 9, maxX = -9, minZ = 9, maxZ = -9;
+        pts.forEach(function (q) { minX = Math.min(minX, q[0]); maxX = Math.max(maxX, q[0]); minZ = Math.min(minZ, q[1]); maxZ = Math.max(maxZ, q[1]); });
+        const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+        const w = E(root, { id: 'wire' + i, position: cx + ' 0.03 ' + cz, geometry: hitbox(maxX - minX + 0.024, 0.025, maxZ - minZ + 0.024), material: HIT, 'vl-act': { action: 'wire', arg: String(i), hoverScale: 1.02 } });
+        const segs = [];
+        for (let j = 0; j < pts.length - 1; j++) {
+          const a = pts[j], b = pts[j + 1], len = Math.hypot(b[0] - a[0], b[1] - a[1]), th = 0.008;
+          const horiz = Math.abs(b[0] - a[0]) > 1e-6;
+          segs.push(E(w, {
+            position: ((a[0] + b[0]) / 2 - cx) + ' 0 ' + ((a[1] + b[1]) / 2 - cz),
+            geometry: { primitive: 'box', width: horiz ? len + th : th, height: th, depth: horiz ? th : len + th },
+            material: mat('#9aa5b1', { transparent: true, opacity: 0.5, emissive: '#000000' })
+          }));
+        }
+        w.segs = segs;
+        return w;
+      });
+
+      // parts
+      const P = this.parts = {};
+      // battery (+ terminal at the far end by default)
+      P.battery = E(root, { id: 'cBattery', geometry: hitbox(0.07, 0.07, 0.15), material: HIT, 'vl-act': { action: 'item', arg: 'battery' } });
+      this.batBody = E(P.battery, { geometry: { primitive: 'cylinder', radius: 0.026, height: 0.12, segmentsRadial: 20 }, material: mat('#1f2328', { emissive: '#000000' }), rotation: '90 0 0' });
+      E(P.battery, { geometry: { primitive: 'cylinder', radius: 0.0265, height: 0.035, segmentsRadial: 20 }, material: mat('#d4a017', { metalness: 0.4 }), rotation: '90 0 0', position: '0 0 -0.04' });
+      this.batNub = E(P.battery, { geometry: { primitive: 'cylinder', radius: 0.009, height: 0.012, segmentsRadial: 12 }, material: mat('#c0c0c0', { metalness: 0.8 }), rotation: '90 0 0', position: '0 0 -0.066' });
+      this.batLabel = E(P.battery, { position: '0 0.0275 0.01', rotation: '-90 0 0', 'vl-text': { value: '+\n3 V\n−', width: 0.04, height: 0.1, size: 0.016, color: '#ffffff', ppm: 1500, lineHeight: 1.6 } });
+      // bulb
+      P.bulb = E(root, { id: 'cBulb', geometry: hitbox(0.09, 0.12, 0.09), material: HIT, 'vl-act': { action: 'item', arg: 'bulb' } });
+      E(P.bulb, { geometry: { primitive: 'box', width: 0.07, height: 0.02, depth: 0.07 }, material: mat('#3d4450'), position: '0 -0.04 0' });
+      E(P.bulb, { geometry: { primitive: 'cylinder', radius: 0.017, height: 0.026, segmentsRadial: 16 }, material: mat('#b8bec7', { metalness: 0.7 }), position: '0 -0.018 0' });
+      this.bulbGlass = E(P.bulb, { geometry: { primitive: 'sphere', radius: 0.034, segmentsWidth: 20, segmentsHeight: 14 }, material: mat('#fff8e0', { transparent: true, opacity: 0.55, emissive: '#000000', emissiveIntensity: 1, roughness: 0.1 }), position: '0 0.025 0' });
+      this.filament = E(P.bulb, { geometry: { primitive: 'torus', radius: 0.008, radiusTubular: 0.0015, segmentsTubular: 16 }, material: mat('#555555', { emissive: '#000000', emissiveIntensity: 1 }), position: '0 0.022 0' });
+      this.glow = E(P.bulb, { geometry: { primitive: 'sphere', radius: 0.07, segmentsWidth: 16, segmentsHeight: 10 }, material: { color: '#ffd27a', shader: 'flat', transparent: true, opacity: 0.28, depthWrite: false, blending: 'additive' }, position: '0 0.025 0', visible: false });
+      this.light = E(P.bulb, { light: { type: 'point', color: '#ffd27a', intensity: 0, distance: 1.2, decay: 2 }, position: '0 0.05 0' });
+      // switch (lever pivots at its left contact)
+      P.switch = E(root, { id: 'cSwitch', geometry: hitbox(0.14, 0.07, 0.07), material: HIT, 'vl-act': { action: 'item', arg: 'switch' } });
+      E(P.switch, { geometry: { primitive: 'box', width: 0.12, height: 0.014, depth: 0.045 }, material: mat('#f1f3f5'), position: '0 -0.02 0' });
+      [-0.045, 0.045].forEach(function (x) { E(P.switch, { geometry: { primitive: 'cylinder', radius: 0.007, height: 0.012, segmentsRadial: 10 }, material: mat('#c0c0c0', { metalness: 0.8 }), position: x + ' -0.008 0' }); });
+      this.leverPivot = E(P.switch, { position: '-0.045 -0.004 0', rotation: '0 0 32' });
+      E(this.leverPivot, { geometry: { primitive: 'box', width: 0.095, height: 0.006, depth: 0.012 }, material: mat('#c0c0c0', { metalness: 0.7 }), position: '0.0475 0 0' });
+      E(this.leverPivot, { geometry: { primitive: 'box', width: 0.02, height: 0.018, depth: 0.02 }, material: mat('#e63946'), position: '0.085 0.008 0' });
+      // extra wire for the optional short-circuit experiment
+      P.extra = E(root, { id: 'cExtra', geometry: hitbox(0.13, 0.04, 0.05), material: HIT, 'vl-act': { action: 'item', arg: 'extra' } });
+      E(P.extra, { geometry: { primitive: 'box', width: 0.11, height: 0.008, depth: 0.008 }, material: mat('#ffd60a') });
+      [-0.058, 0.058].forEach(function (x) { E(P.extra, { geometry: { primitive: 'box', width: 0.012, height: 0.006, depth: 0.006 }, material: mat('#d4733a', { metalness: 0.5 }), position: x + ' 0 0' }); });
+
+      Object.keys(TRAY).forEach(function (k) {
+        tag(root, { battery: 'Battery 3 V', bulb: 'Bulb', switch: 'Switch', extra: 'Extra wire\n(optional)' }[k], TRAY[k][0] + ' 0.023 0.305', { rot: '-65 0 0', t: { width: 0.15, height: 0.05, size: 0.0135 } });
+      });
+
+      // multimeter (simulated readings)
+      const mm = E(root, { position: '0.6 0.11 -0.2', rotation: '-14 -24 0' });
+      E(mm, { geometry: { primitive: 'box', width: 0.15, height: 0.22, depth: 0.04 }, material: mat('#f4c430') });
+      this.meter = E(mm, { position: '0 0.035 0.021', 'vl-text': { value: '', width: 0.125, height: 0.11, size: 0.019, bg: '#c8d5b9', color: '#10140c', radius: 0.006, ppm: 1500, lineHeight: 1.3 } });
+      E(mm, { geometry: { primitive: 'cylinder', radius: 0.025, height: 0.01, segmentsRadial: 16 }, material: mat('#222222'), position: '0 -0.06 0.022', rotation: '90 0 0' });
+      tag(root, 'Multimeter\n(simulated)', '0.6 0.006 -0.03', { t: { width: 0.14, height: 0.055, size: 0.0135 } });
+
+      // moving "current" dots
+      this.dots = [];
+      for (let i = 0; i < 12; i++) this.dots.push(E(root, { geometry: { primitive: 'sphere', radius: 0.0065, segmentsWidth: 8, segmentsHeight: 6 }, material: { color: '#7fdbff', shader: 'flat' }, visible: false }));
+      this.loop = [[XL, -0.06], [XL, ZT], [XR, ZT], [XR, ZB], [XL, ZB], [XL, -0.06]];
+      let L = 0; this.loopLen = [0];
+      for (let i = 1; i < this.loop.length; i++) { L += Math.hypot(this.loop[i][0] - this.loop[i - 1][0], this.loop[i][1] - this.loop[i - 1][1]); this.loopLen.push(L); }
+      this.L = L;
+    },
+
+    reset: function () {
+      this.s = { held: null, placed: { battery: false, bulb: false, switch: false }, wires: [false, false, false], extra: false, closed: false, flipped: false, lit: false, litOnce: false, offAfter: false, answered: false, complete: false, mistakes: new Set() };
+      const self = this;
+      Object.keys(this.parts).forEach(function (k) { const o = self.parts[k].object3D; o.position.fromArray(TRAY[k]); o.rotation.set(0, 0, 0); });
+      Object.keys(this.slots).forEach(function (k) { self.slots[k].dataset.off = ''; });
+      this.slots.bypass.object3D.visible = false; this.bypassTag.object3D.visible = false;
+      this.wireEls.forEach(function (w) { self.paintWire(w, false); });
+      this.leverPivot.object3D.rotation.z = THREE.MathUtils.degToRad(32);
+      this.setFlip(false);
+      this.setLit(false);
+      const bm = meshMat(this.batBody); if (bm) bm.emissive.setHex(0);
+      this.updateMeter();
+      VL.setChoices([]);
+    },
+
+    stepDone: function () {
+      const s = this.s;
+      return [s.placed.battery, s.placed.bulb, s.placed.switch, s.wires.every(Boolean), s.litOnce, s.offAfter, s.answered];
+    },
+    render: function (fb) {
+      const s = this.s, done = this.stepDone(), self = this;
+      let cur = done.indexOf(false); if (cur < 0) cur = done.length;
+      VL.view = {
+        kind: 'task', title: 'Virtual Laboratory', subtitle: 'Activity 2 · Simple Circuit',
+        status: 'Holding ' + (s.held ? PART[s.held] : 'nothing') + '  ·  Switch ' + (s.closed ? 'CLOSED' : 'open') + '  ·  Bulb ' + (s.lit ? 'ON' : 'off') + '  (simulated)',
+        steps: done.map(function (d, i) { return { text: self.stepText(i), done: d }; }), current: cur,
+        feedback: fb || VL.view.feedback
+      };
+      if (fb) SFX.play(fb.type === 'success' ? 'good' : fb.type === 'warn' ? 'warn' : null);
+      VL.draw();
+    },
+    hint: function () {
+      const s = this.s, done = this.stepDone(), cur = done.indexOf(false);
+      let text = cur < 0 ? 'All done!' : this.hints[cur];
+      if (s.extra && s.closed) text = 'The extra wire is shorting the bulb. Click the yellow extra wire to remove it.';
+      this.render({ type: 'info', text: 'Hint — ' + text });
+    },
+
+    handle: function (action, arg) {
+      const s = this.s;
+      if (s.complete) { VL.toast('info', 'This activity is complete. Use Retry on the panel or Reset activity on the right to practise again.'); return; }
+      if (action === 'item') this.item(arg);
+      else if (action === 'slot') this.slot(arg);
+      else if (action === 'wire') this.wire(+arg);
+      else if (action === 'answer') this.answer(arg);
+    },
+
+    item: function (k) {
+      const s = this.s;
+      if (k === 'battery' && s.placed.battery) {
+        this.setFlip(!s.flipped);
+        const msg = this.evaluate('flip');
+        this.render(msg || { type: 'info', text: 'Battery flipped round. A filament bulb lights either way (simulated). Some parts, such as LEDs, only work one way.' });
+        return;
+      }
+      if (k === 'switch' && s.placed.switch) { this.toggleSwitch(); return; }
+      if (k === 'bulb' && s.placed.bulb) { this.render({ type: 'info', text: 'The bulb is seated in its socket. Close the switch to test it.' }); return; }
+      if (k === 'extra' && s.extra) {
+        s.extra = false; this.move('extra', TRAY.extra, 0);
+        this.slots.bypass.dataset.off = '';
+        const msg = this.evaluate('unshort');
+        this.render(msg || { type: 'info', text: 'Extra wire removed — the bulb is back in the loop.' });
+        return;
+      }
+      // pick up / put down
+      if (s.held === k) { this.drop(k); s.held = null; this.render({ type: 'info', text: 'Put the ' + PART[k] + ' back on the tray.' }); return; }
+      if (s.held) this.drop(s.held);
+      s.held = k;
+      const o = this.parts[k].object3D, y0 = TRAY[k][1];
+      VL.tween(0.2, function (p) { o.position.y = lerp(y0, y0 + 0.05, p); });
+      const where = k === 'extra' ? 'the dashed BYPASS marker beside the bulb (optional experiment)' : 'its ' + SLOT_NAME[k];
+      if (k === 'extra' && !s.placed.bulb) { this.render({ type: 'info', text: 'Holding the extra wire. Its BYPASS marker appears once the bulb is placed.' }); return; }
+      this.render({ type: 'info', text: 'Holding the ' + PART[k] + '. Now click ' + where + '.' });
+    },
+    drop: function (k) { const o = this.parts[k].object3D, y0 = o.position.y, y1 = TRAY[k][1]; VL.tween(0.2, function (p) { o.position.y = lerp(y0, y1, p); }); },
+    move: function (k, pos, rotY, done) {
+      const o = this.parts[k].object3D, from = o.position.clone(), to = new THREE.Vector3(pos[0], pos[1], pos[2]), r0 = o.rotation.y;
+      VL.busy++;
+      VL.tween(0.45, function (p) { o.position.lerpVectors(from, to, p); o.position.y += Math.sin(p * Math.PI) * 0.06; o.rotation.y = lerp(r0, rotY, p); }, function () { VL.busy--; if (done) done(); });
+    },
+
+    slot: function (k) {
+      const s = this.s, self = this;
+      if (!s.held) {
+        const txt = k === 'bypass'
+          ? 'This optional marker lets you test a short circuit: pick up the extra wire from the tray, then click here.'
+          : 'This is the ' + SLOT_NAME[k] + '. Pick up the ' + PART[k] + ' from the parts tray first.';
+        this.render({ type: 'info', text: txt });
+        return;
+      }
+      const h = s.held;
+      const ok = (h === k) || (h === 'extra' && k === 'bypass');
+      if (!ok) {
+        if (h === 'extra') { this.render({ type: 'info', text: 'The extra wire is only for the optional experiment: place it on the dashed BYPASS marker beside the bulb.' }); return; }
+        s.mistakes.add('wrong-slot');
+        this.render({ type: 'warn', text: 'That is the ' + SLOT_NAME[k] + ' — the ' + PART[h] + ' goes in its ' + SLOT_NAME[h] + '. Nothing breaks in the simulation; just try the matching spot.' });
+        return;
+      }
+      s.held = null;
+      this.slots[k].dataset.off = '1';
+      const p = SLOT[k], y = TRAY[h][1] + 0.002;
+      const rotY = h === 'switch' ? 0 : h === 'extra' ? Math.PI / 2 : 0;
+      this.move(h, [p[0], y, p[1]], rotY, function () {
+        if (h === 'extra') {
+          s.extra = true;
+          const msg = self.evaluate('short');
+          self.render(msg || { type: 'info', text: 'Extra wire placed across the bulb (a bypass). Close the switch to see what a short circuit does in this simulation. Click the wire to remove it.' });
+          return;
+        }
+        s.placed[h] = true;
+        if (h === 'bulb') { self.slots.bypass.object3D.visible = true; self.bypassTag.object3D.visible = true; }
+        const msg = self.evaluate('place');
+        self.render(msg || { type: 'success', text: { battery: 'Battery in place. It is the energy source that pushes current round the loop (simulated 3 V).', bulb: 'Bulb seated. It glows when current flows through its thin filament.', switch: 'Switch in place. It is open (lever up), so it makes a gap in the loop.' }[h] + ' Next: ' + self.stepText(self.stepDone().indexOf(false)).replace(/^./, function (c) { return c.toLowerCase(); }) });
+      });
+    },
+
+    wire: function (i) {
+      const s = this.s;
+      s.wires[i] = !s.wires[i];
+      this.paintWire(this.wireEls[i], s.wires[i]);
+      const n = s.wires.filter(Boolean).length;
+      const msg = this.evaluate('wire');
+      if (msg) { this.render(msg); return; }
+      this.render(s.wires[i]
+        ? { type: n === 3 ? 'success' : 'info', text: 'Wire connected (' + n + '/3).' + (n === 3 ? ' All gaps joined. Next: close the switch.' : '') }
+        : { type: 'info', text: 'Wire removed (' + n + '/3). An open gap breaks the loop. Click it again to reconnect.' });
+    },
+    paintWire: function (w, on) {
+      w.on = on;
+      w.segs.forEach(function (sg) {
+        const m = meshMat(sg);
+        if (m) { m.color.set(on ? '#d4733a' : '#9aa5b1'); m.opacity = on ? 1 : 0.5; m.transparent = !on; m.metalness = on ? 0.5 : 0.05; m.needsUpdate = true; }
+        else sg.setAttribute('material', { color: on ? '#d4733a' : '#9aa5b1', opacity: on ? 1 : 0.5, transparent: !on });
+      });
+    },
+
+    toggleSwitch: function () {
+      const s = this.s, self = this;
+      s.closed = !s.closed;
+      const o = this.leverPivot.object3D, r0 = o.rotation.z, r1 = s.closed ? 0 : THREE.MathUtils.degToRad(32);
+      VL.busy++;
+      VL.tween(0.25, function (p) { o.rotation.z = lerp(r0, r1, p); }, function () {
+        VL.busy--;
+        self.render(self.evaluate('switch') || { type: 'info', text: 'Switch opened.' });
+      });
+    },
+    setFlip: function (f) {
+      this.s.flipped = f;
+      this.batNub.object3D.position.z = f ? 0.066 : -0.066;
+      setText(this.batLabel, f ? '−\n3 V\n+' : '+\n3 V\n−');
+    },
+
+    // decide what the circuit does and return a feedback message (or null)
+    evaluate: function (cause) {
+      const s = this.s, P = s.placed;
+      const complete = P.battery && P.bulb && P.switch && s.wires.every(Boolean);
+      const wasLit = s.lit;
+      let msg = null;
+      if (s.closed && complete && s.extra) {
+        this.setLit(false);
+        s.mistakes.add('short');
+        msg = { type: 'warn', text: 'Short circuit (simulated)! The extra wire gives current an easy path around the bulb, so the bulb stays dark and the meter reads very high. Real batteries and wires can get hot this way. Click the yellow extra wire to remove it.' };
+      } else if (s.closed && complete) {
+        this.setLit(true);
+        if (!wasLit) {
+          s.litOnce = true;
+          msg = { type: 'success', text: 'The bulb lights! Current (simulated) flows round the complete loop: battery → wire → switch → wire → bulb → wire → back to the battery. Next: open the switch.' };
+        }
+      } else {
+        this.setLit(false);
+        if (s.closed && cause === 'switch') {
+          s.mistakes.add('open-circuit');
+          const miss = [];
+          if (!P.battery) miss.push('battery'); if (!P.bulb) miss.push('bulb');
+          const nw = s.wires.filter(function (w) { return !w; }).length;
+          if (nw) miss.push(nw + ' wire gap' + (nw > 1 ? 's' : ''));
+          msg = { type: 'warn', text: 'Switch closed, but the bulb stays dark: the loop is not complete yet. Missing: ' + miss.join(', ') + '. Current (simulated) needs an unbroken path from the battery all the way back.' };
+        } else if (!s.closed && cause === 'switch' && wasLit) {
+          s.offAfter = true;
+          msg = { type: 'success', text: 'Bulb off. Opening the switch makes a gap, so the loop is broken and current stops. Now answer the question below.' };
+          VL.setChoices([
+            { label: 'Loop broken → no current', action: 'answer', arg: 'loop', color: '#1f6feb' },
+            { label: 'Battery ran out', action: 'answer', arg: 'battery', color: '#1f6feb' },
+            { label: 'Bulb burned out', action: 'answer', arg: 'bulb', color: '#1f6feb' }
+          ]);
+        } else if (wasLit) {
+          msg = { type: 'info', text: 'The bulb went out because the loop was broken. Reconnect it to relight.' };
+        }
+      }
+      this.updateMeter();
+      return msg;
+    },
+    setLit: function (on) {
+      this.s.lit = on;
+      const gm = meshMat(this.bulbGlass), fm = meshMat(this.filament);
+      if (gm) { gm.emissive.set(on ? '#ffcc55' : '#000000'); gm.opacity = on ? 0.9 : 0.55; }
+      if (fm) fm.emissive.set(on ? '#fff2c4' : '#000000');
+      this.glow.object3D.visible = on;
+      this.light.setAttribute('light', 'intensity', on ? 1.6 : 0);
+      this.dots.forEach(function (d) { d.object3D.visible = on; });
+    },
+    updateMeter: function () {
+      const s = this.s, P = s.placed, complete = P.battery && P.bulb && P.switch && s.wires.every(Boolean);
+      let v = P.battery ? '3.0 V' : '0.0 V', a = '0.00 A';
+      if (s.closed && complete && s.extra) { v = '0.4 V'; a = 'HIGH!'; }
+      else if (s.lit) a = '0.30 A';
+      setText(this.meter, v + '\n' + a + '\n(simulated)');
+    },
+
+    answer: function (a) {
+      const s = this.s;
+      if (a === 'loop') { s.answered = true; s.complete = true; VL.setChoices([]); VL.complete('circuit', s.mistakes); return; }
+      s.mistakes.add('circ-quiz');
+      const why = a === 'battery'
+        ? 'The battery is not empty — closing the switch again would relight the bulb.'
+        : 'The bulb is fine — it relights as soon as the switch closes.';
+      this.render({ type: 'warn', text: 'Not quite. ' + why + ' The open switch is a gap, so the loop is broken. Try again.' });
+    },
+
+    pointAt: function (f) {
+      const d = f * this.L, lp = this.loop, ll = this.loopLen;
+      for (let i = 1; i < lp.length; i++) {
+        if (d <= ll[i]) { const p = (d - ll[i - 1]) / (ll[i] - ll[i - 1]); return [lerp(lp[i - 1][0], lp[i][0], p), lerp(lp[i - 1][1], lp[i][1], p)]; }
+      }
+      return lp[lp.length - 1];
+    },
+    tick: function (t) {
+      const s = this.s; if (!s) return;
+      const pulse = 0.35 + 0.3 * (0.5 + 0.5 * Math.sin(t * 4));
+      this.wireEls.forEach(function (w) { if (!w.on) w.segs.forEach(function (sg) { const m = meshMat(sg); if (m) m.opacity = pulse; }); });
+      if (s.lit) {
+        const self = this, dir = s.flipped ? -1 : 1;
+        this.dots.forEach(function (d, i) {
+          let f = ((t * 0.18 * dir + i / self.dots.length) % 1 + 1) % 1;
+          const q = self.pointAt(f); d.object3D.position.set(q[0], 0.04, q[1]);
+        });
+      }
+      const bm = meshMat(this.batBody);
+      if (bm) { if (s.closed && s.extra && s.placed.battery && s.wires.every(Boolean) && s.placed.bulb && s.placed.switch) bm.emissive.setRGB(0.5 + 0.4 * Math.sin(t * 8), 0.12, 0); else bm.emissive.setHex(0); }
+    }
+  };
+
+  // =====================================================================
+  //   PROCEDURAL SOUND (Web Audio, no files)
+  // =====================================================================
+  const SFX = {
+    ctx: null,
+    get: function () {
+      if (!this.ctx) { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; } }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(function () {});
+      return this.ctx;
+    },
+    tone: function (f, d, type, g, when) {
+      const c = this.get(); if (!c) return;
+      const o = c.createOscillator(), gn = c.createGain(), t = c.currentTime + (when || 0);
+      o.type = type || 'sine'; o.frequency.value = f;
+      gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(g || 0.08, t + 0.01); gn.gain.exponentialRampToValueAtTime(0.0001, t + d);
+      o.connect(gn); gn.connect(c.destination); o.start(t); o.stop(t + d + 0.03);
+    },
+    noise: function (d, g) {
+      const c = this.get(); if (!c) return;
+      const buf = c.createBuffer(1, Math.floor(c.sampleRate * d), c.sampleRate), ch = buf.getChannelData(0);
+      for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / ch.length);
+      const src = c.createBufferSource(), bp = c.createBiquadFilter(), gn = c.createGain();
+      bp.type = 'bandpass'; bp.frequency.value = 3200; gn.gain.value = g;
+      src.buffer = buf; src.connect(bp); bp.connect(gn); gn.connect(c.destination); src.start();
+    },
+    play: function (name) {
+      if (!name) return;
+      try {
+        const self = this;
+        switch (name) {
+          case 'click': this.tone(880, 0.05, 'square', 0.025); break;
+          case 'good': this.tone(660, 0.12, 'sine', 0.08); this.tone(990, 0.18, 'sine', 0.08, 0.1); break;
+          case 'warn': this.tone(300, 0.2, 'triangle', 0.09); this.tone(220, 0.25, 'triangle', 0.07, 0.12); break;
+          case 'done': [523, 659, 784, 1047].forEach(function (f, i) { self.tone(f, 0.25, 'sine', 0.08, i * 0.12); }); break;
+          case 'fizz': this.noise(1.2, 0.05); break;
+        }
+      } catch (e) { /* audio is optional */ }
+    }
+  };
+
+  VL.Chem = Chem; VL.Circ = Circ;   // handy for debugging in the browser console
+
+  // procedural floor tiles
+  AFRAME.registerComponent('vl-floor', {
+    init: function () {
+      const c = document.createElement('canvas'); c.width = c.height = 256;
+      const x = c.getContext('2d');
+      x.fillStyle = '#3b4352'; x.fillRect(0, 0, 256, 256);
+      x.fillStyle = '#434c5c'; x.fillRect(0, 0, 128, 128); x.fillRect(128, 128, 128, 128);
+      x.strokeStyle = '#2b313c'; x.lineWidth = 4; x.strokeRect(0, 0, 256, 256); x.beginPath(); x.moveTo(128, 0); x.lineTo(128, 256); x.moveTo(0, 128); x.lineTo(256, 128); x.stroke();
+      const t = makeTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(10, 10);
+      const el = this.el;
+      const apply = function () { const m = el.getObject3D('mesh'); if (m) { m.material.map = t; m.material.needsUpdate = true; } };
+      if (el.getObject3D('mesh')) apply(); else el.addEventListener('object3dset', apply);
+    }
+  });
+})();
+</script>
+</head>
+<body>
+<div id="hud">
+  <b>Virtual Laboratory</b> &middot; Desktop: drag to look, click to select &middot; Keys <b>1</b>/<b>2</b> activity, <b>H</b> hint, <b>R</b> reset, <b>M</b> menu.<br>
+  Meta Quest: press the <b>VR</b> button (bottom-right), then point the controller laser and pull the trigger.
+  <span class="sim">Simulated educational demonstration &mdash; not real lab guidance or scientific measurement.</span>
+</div>
+
+<a-scene vl-app
+  renderer="antialias: true; colorManagement: true; foveationLevel: 1"
+  background="color: #1b2331"
+  xr-mode-ui="enabled: true"
+  webxr="optionalFeatures: local-floor"
+  loading-screen="dotsColor: #ffd60a; backgroundColor: #0b1320"
+  cursor="rayOrigin: mouse; fuse: false"
+  raycaster="objects: .clickable; far: 10; interval: 40">
+
+  <!-- user rig: no locomotion; only head turning -->
+  <a-entity id="rig">
+    <a-entity id="cam" camera="fov: 70" position="0 1.6 0" look-controls="pointerLockEnabled: false; magicWindowTrackingEnabled: false" wasd-controls="enabled: false">
+      <!-- gaze (fuse) cursor: auto-enabled in VR when no controllers are connected -->
+      <a-entity id="gazeCursor" position="0 0 -0.9" visible="false"
+        cursor="fuse: true; fuseTimeout: 1500"
+        raycaster="objects: .clickable; far: 6; enabled: false"
+        geometry="primitive: ring; radiusInner: 0.011; radiusOuter: 0.017; segmentsTheta: 32"
+        material="color: #ffffff; shader: flat; depthTest: false; transparent: true"
+        vl-ray-feedback
+        animation__fusing="property: scale; startEvents: fusing; from: 1 1 1; to: 0.35 0.35 0.35; dur: 1500; easing: linear"
+        animation__leave="property: scale; startEvents: mouseleave; to: 1 1 1; dur: 120"
+        animation__click="property: scale; startEvents: click; to: 1 1 1; dur: 120"></a-entity>
+    </a-entity>
+    <a-entity id="leftHand" laser-controls="hand: left" raycaster="objects: .clickable; far: 6; lineColor: #7fdbff; lineOpacity: 0.9" vl-ray-feedback></a-entity>
+    <a-entity id="rightHand" laser-controls="hand: right" raycaster="objects: .clickable; far: 6; lineColor: #7fdbff; lineOpacity: 0.9" vl-ray-feedback></a-entity>
+  </a-entity>
+
+  <!-- lights -->
+  <a-entity light="type: hemisphere; color: #ffffff; groundColor: #4a5160; intensity: 1.1"></a-entity>
+  <a-entity light="type: directional; color: #ffffff; intensity: 1.1" position="1.5 3 2"></a-entity>
+
+  <!-- everything in the world (lowered as a whole in seated mode) -->
+  <a-entity id="world">
+    <!-- room -->
+    <a-plane vl-floor width="10" height="10" rotation="-90 0 0" material="color: #ffffff; roughness: 0.95"></a-plane>
+    <a-plane width="8" height="3.4" position="0 1.7 -3.4" material="color: #d9e2ec; roughness: 1"></a-plane>
+    <a-plane width="8" height="3.4" position="-3.4 1.7 0" rotation="0 90 0" material="color: #cfd9e4; roughness: 1"></a-plane>
+    <a-plane width="8" height="3.4" position="3.4 1.7 0" rotation="0 -90 0" material="color: #cfd9e4; roughness: 1"></a-plane>
+    <a-plane width="8" height="3.4" position="0 1.7 3.4" rotation="0 180 0" material="color: #d9e2ec; roughness: 1"></a-plane>
+    <a-plane width="8" height="8" position="0 3.4 0" rotation="90 0 0" material="color: #eef2f6; roughness: 1"></a-plane>
+    <a-plane width="1.6" height="0.5" position="0 3.39 -1" rotation="90 0 0" material="color: #ffffff; shader: flat"></a-plane>
+    <a-plane width="1.6" height="0.5" position="0 3.39 1.2" rotation="90 0 0" material="color: #ffffff; shader: flat"></a-plane>
+    <a-box width="8" height="0.12" depth="0.04" position="0 0.06 -3.38" color="#5b6573"></a-box>
+
+    <!-- back-wall shelves with bottles (decoration) -->
+    <a-entity position="-2.1 0 -3.25">
+      <a-box width="1.4" height="0.04" depth="0.3" position="0 1.2 0" color="#8b5e34"></a-box>
+      <a-box width="1.4" height="0.04" depth="0.3" position="0 1.7 0" color="#8b5e34"></a-box>
+      <a-cylinder radius="0.05" height="0.22" position="-0.5 1.33 0" material="color: #9ad1ff; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.05" height="0.18" position="-0.25 1.31 0" material="color: #ffb3c1; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.06" height="0.24" position="0.05 1.34 0" material="color: #c8f7c5; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.045" height="0.2" position="0.35 1.32 0" material="color: #ffe08a; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.05" height="0.2" position="-0.4 1.82 0" material="color: #d0bfff; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.06" height="0.16" position="0.1 1.8 0" material="color: #9ad1ff; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.04" height="0.22" position="0.45 1.83 0" material="color: #ffc9a3; opacity: 0.8; transparent: true"></a-cylinder>
+    </a-entity>
+    <a-entity position="2.1 0 -3.25">
+      <a-box width="1.4" height="0.04" depth="0.3" position="0 1.2 0" color="#8b5e34"></a-box>
+      <a-box width="1.4" height="0.04" depth="0.3" position="0 1.7 0" color="#8b5e34"></a-box>
+      <a-sphere radius="0.08" position="-0.4 1.3 0" material="color: #b9e6ff; opacity: 0.7; transparent: true"></a-sphere>
+      <a-cylinder radius="0.03" height="0.12" position="-0.4 1.42 0" material="color: #b9e6ff; opacity: 0.7; transparent: true"></a-cylinder>
+      <a-box width="0.25" height="0.18" depth="0.2" position="0.2 1.31 0" color="#4b5563"></a-box>
+      <a-cylinder radius="0.05" height="0.2" position="-0.2 1.82 0" material="color: #ffd6a5; opacity: 0.8; transparent: true"></a-cylinder>
+      <a-cylinder radius="0.05" height="0.24" position="0.3 1.84 0" material="color: #caffbf; opacity: 0.8; transparent: true"></a-cylinder>
+    </a-entity>
+    <a-entity position="0 2.75 -3.38" vl-text="value: LAB SAFETY (SIMULATED POSTER) \n1. Eye protection first \n2. Read every label \n3. Report spills at once; width: 1.4; height: 0.55; size: 0.07; bg: #ffffff; border: #e63946; color: #111111; ppm: 400; radius: 0.02"></a-entity>
+
+    <!-- lab bench -->
+    <a-box width="1.5" height="0.86" depth="0.72" position="0 0.43 -0.85" color="#dfe7ef"></a-box>
+    <a-box width="1.56" height="0.04" depth="0.78" position="0 0.88 -0.85" color="#27303b"></a-box>
+    <a-box width="0.7" height="0.6" depth="0.01" position="-0.37 0.45 -0.455" color="#c7d2de"></a-box>
+    <a-box width="0.7" height="0.6" depth="0.01" position="0.37 0.45 -0.455" color="#c7d2de"></a-box>
+
+    <!-- activity stations (built by script) -->
+    <a-entity id="chem" position="0 0.9 -0.85" visible="false"></a-entity>
+    <a-entity id="circuit" position="0 0.9 -0.85" visible="false"></a-entity>
+
+    <!-- main instruction panel -->
+    <a-entity id="panel" position="0 1.62 -1.8">
+      <a-box width="1.66" height="1.06" depth="0.03" color="#22344d"></a-box>
+      <a-entity id="panelCanvas" position="0 0 0.017" vl-canvas="width: 1.6; height: 1.0; ppm: 800"></a-entity>
+      <a-entity id="choice0" position="-0.52 -0.425 0.03" vl-button="label: .; width: 0.48; height: 0.1; size: 0.034"></a-entity>
+      <a-entity id="choice1" position="0 -0.425 0.03" vl-button="label: .; width: 0.48; height: 0.1; size: 0.034"></a-entity>
+      <a-entity id="choice2" position="0.52 -0.425 0.03" vl-button="label: .; width: 0.48; height: 0.1; size: 0.034"></a-entity>
+    </a-entity>
+    <a-entity id="doneBanner" position="0 2.24 -1.78" visible="false"
+      vl-text="value: ACTIVITY COMPLETE; width: 0.9; height: 0.13; size: 0.07; bg: #2ec27e; color: #06260f; radius: 0.03; ppm: 700"></a-entity>
+
+    <!-- left: how-to + disclaimer -->
+    <a-entity position="-1.05 1.34 -1.25" rotation="0 38 0">
+      <a-box width="0.66" height="0.76" depth="0.02" color="#22344d" position="0 0 -0.012"></a-box>
+      <a-entity id="infoText" vl-text="value: .; width: 0.62; height: 0.72; size: 0.026; bg: #0d1520; color: #f2f6fb; align: left; bold: false; pad: 0.03; radius: 0.02; ppm: 1100; lineHeight: 1.3"></a-entity>
+    </a-entity>
+
+    <!-- right: controls -->
+    <a-entity id="controls" position="1.05 1.34 -1.25" rotation="0 -38 0">
+      <a-box width="0.46" height="0.66" depth="0.02" color="#22344d" position="0 0 -0.015"></a-box>
+      <a-entity id="ctlTitle" position="0 0.27 0" vl-text="value: .; width: 0.4; height: 0.06; size: 0.032; color: #ffd60a; ppm: 900"></a-entity>
+      <a-entity id="btnMenu" position="0 0.17 0" vl-button="label: Menu; width: 0.4; height: 0.085; color: #4b5563; action: menu"></a-entity>
+      <a-entity id="btnReset" position="0 0.07 0" vl-button="label: Reset activity; width: 0.4; height: 0.085; color: #b42318; action: reset"></a-entity>
+      <a-entity id="btnHint" position="0 -0.03 0" vl-button="label: Hint; width: 0.4; height: 0.085; color: #1f6feb; action: hint"></a-entity>
+      <a-entity id="btnSeated" position="0 -0.13 0" vl-button="label: Seated mode · off; width: 0.4; height: 0.085; color: #0f7b6c; action: seated"></a-entity>
+      <a-entity id="btnGaze" position="0 -0.23 0" vl-button="label: Gaze select · Auto; width: 0.4; height: 0.085; color: #6741d9; action: gaze; size: 0.028"></a-entity>
+    </a-entity>
+  </a-entity>
+</a-scene>
+</body>
+</html>
